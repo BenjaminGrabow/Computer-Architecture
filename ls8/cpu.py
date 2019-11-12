@@ -1,57 +1,125 @@
 """CPU functionality."""
 
 import sys
+from datetime import datetime  # for timer interrupt
+
+# Opcodes:
+
+ADD = 0b10100000
+CALL = 0b01010000
+CMP = 0b10100111
+DEC = 0b01100110
+DIV = 0b10100011
+HLT = 0b00000001
+INC = 0b01100101
+IRET = 0b00010011
+JEQ = 0b01010101
+JMP = 0b01010100
+JNE = 0b01010110
+LD = 0b10000011
+LDI = 0b10000010
+MUL = 0b10100010
+OR = 0b10101010
+POP = 0b01000110
+PRA = 0b01001000
+PRN = 0b01000111
+PUSH = 0b01000101
+RET = 0b00010001
+ST = 0b10000100
+SUB = 0b10100001
+
+# Reserved general-purpose register numbers:
+
+IM = 5
+IS = 6
+SP = 7
+
+# CMP flags:
+
+FL_LT = 0b100
+FL_GT = 0b010
+FL_EQ = 0b001
+
+# IS flags
+
+IS_TIMER = 0b00000001
+IS_KEYBOARD = 0b00000010
+
 
 class CPU:
     """Main CPU class."""
 
     def __init__(self):
         """Construct a new CPU."""
-        # registers R0 thru R7
-        # R5 is reserved as the interrupt mask (IM)
-        # R6 is reserved as the interrupt status (IS)
-        # R7 is reserved as the stack pointer (SP)
-        self.registers = [0b0] * 8
+        self.pc = 0  # program counter
+        self.fl = 0  # flags
+        self.ie = 1  # interrupts enabled
 
-        # internal registers
-        self.pc = 0 # PC: Program Counter, address of the currently executing instruction
-        self.ir = None # IR: Instruction Register, contains a copy of the currently executing instruction
-        self.mar = None # MAR: Memory Address Register, holds the memory address we're reading or writing
-        self.mdr = None # MDR: Memory Data Register, holds the value to write or the value just read
-        self.fl = None # FL: Flags, see below
-        self.spl = None # stack pointer location
-        #
-        self.ram = [0b0] * 0xFF
-        self.spl = 8 - 1
-        self.registers[self.spl] = 0xF4
+        self.halted = False
 
-        # opcodes
-        self.OPCODES = {0b10000010: 'LDI',
-                        0b01000111: 'PRN',
-                        0b00000001: 'HLT',
-                        0b10100010: 'MUL',
-                        0b01000110: 'POP',
-                        0b01000101: 'PUSH',
-                        0b10000100: 'ST',
+        self.last_timer_int = None
+
+        self.inst_set_pc = False  # True if this instruction set the PC
+
+        self.ram = [0] * 256
+
+        self.reg = [0] * 8
+        self.reg[SP] = 0xf4
+
+        self.bt = {  # branch table
+            ADD: self.op_add,
+            CALL: self.op_call,
+            CMP: self.op_cmp,
+            DEC: self.op_dec,
+            DIV: self.op_div,
+            HLT: self.op_hlt,
+            INC: self.op_inc,
+            IRET: self.op_iret,
+            JEQ: self.op_jeq,
+            JMP: self.op_jmp,
+            JNE: self.op_jne,
+            LD: self.op_ld,
+            LDI: self.op_ldi,
+            MUL: self.op_mul,
+            OR: self.op_or,
+            POP: self.op_pop,
+            PRA: self.op_pra,
+            PRN: self.op_prn,
+            PUSH: self.op_push,
+            RET: self.op_ret,
+            ST: self.op_st,
+            SUB: self.op_sub,
         }
 
+    def load(self, filename):
+        """Load a file from disk into memory."""
+        address = 0
+        with open(filename) as fp:
+            for line in fp:
+                comment_split = line.split("#")
+                num = comment_split[0].strip()
+                if num == '':  # ignore blanks
+                    continue
+                val = int(num, 2)
 
-    def load(self):
-        """Load a program into memory."""
-        try:
-
-            with open(filename, 'r') as f:
-              lines = (line for line in f.readlines() if not (line[0]=='#' or line[0]=='\n'))
-
-              program = [int(line.split('#')[0].strip(), 2) for line in lines]
-              
-              address = 0
-              for instruction in program:
-                self.ram[address] = instruction
+                self.ram[address] = val
                 address += 1
-        except FileNotFoundError as e:
-            print(e)
-            sys.exit()
+    
+    def ram_write(self, mdr, mar):
+        self.ram[mar] = mdr
+
+    def ram_read(self, mar):
+        return self.ram[mar]
+    
+    def push_val(self, val):
+      self.reg[SP] -= 1
+      self.ram_write(val, self.reg[7])
+    
+    def pop_val(self):
+      val = self.ram_read(self.reg[7])
+      self.reg[SP] += 1
+
+      return val
         # # For now, we've just hardcoded a program:
 
         # program = [
@@ -68,120 +136,196 @@ class CPU:
         #     self.ram[address] = instruction
         #     address += 1
 
-
     def alu(self, op, reg_a, reg_b):
         """ALU operations."""
 
         if op == "ADD":
-            self.registers[reg_a] += self.registers[reg_b]
-        #elif op == "SUB": etc
+            self.reg[reg_a] += self.reg[reg_b]
+        # elif op == "SUB": etc
+        elif op == "SUB":
+            self.reg[reg_a] -= self.reg[reg_b]
         elif op == "MUL":
-            self.registers[reg_a] *= self.registers[reg_b]
+            self.reg[reg_a] *= self.reg[reg_b]
+        elif op == "DIV":
+            self.reg[reg_a] /= self.reg[reg_b]
+        elif op == "DEC":
+            self.reg[reg_a] -= 1
+        elif op == "INC":
+            self.reg[reg_a] += 1
+        elif op == "CMP":
+            self.fl &= 0x11111000  # clear all CMP flags
+            if self.reg[reg_a] < self.reg[reg_b]:
+                self.fl |= FL_LT
+            elif self.reg[reg_a] > self.reg[reg_b]:
+                self.fl |= FL_GT
+            else:
+                self.fl |= FL_EQ
+        elif op == "OR":
+            self.reg[reg_a] |= self.reg[reg_b]
         else:
             raise Exception("Unsupported ALU operation")
+    
+    def check_for_timer_int(self):
+      """Check the time to see if a timer interrupt should fire."""
+      if self.last_timer_int == None:
+        self.last_timer_int = datetime.now()
+      now = datetime.now()
+
+      diff = now - self.last_timer_int
+
+      if diff.seconds >= 1:  # OK, fire!
+            self.last_timer_int = now
+            self.reg[IS] |= IS_TIMER
+
+    def handle_ints(self):
+        if not self.ie:  # see if interrupts enabled
+            return
+
+        # Mask out interrupts
+        masked_ints = self.reg[IM] & self.reg[IS]
+        for i in range(8):
+            # See if the interrupt triggered
+            if masked_ints & (1 << i):
+                self.ie = 0   # disable interrupts
+                self.reg[IS] &= ~(1 << i)  # clear bit for this interrupt
+
+                # Save all the work on the stack
+                self.push_val(self.pc)
+                self.push_val(self.fl)
+                for r in range(7):
+                    self.push_val(self.reg[r])
+
+                # Look up the address vector and jump to it
+                self.pc = self.ram_read(0xf8 + i)
+
+                break  # no more processing
 
     def trace(self):
-        """
-        Handy function to print out the CPU state. You might want to call this
-        from run() if you need help debugging.
-        """
-
-        print(f"TRACE: %02X | %02X %02X %02X |" % (
+        print(f"TRACE: %02X | %02X | %d | %02X %02X %02X |" % (
             self.pc,
-            #self.fl,
-            #self.ie,
+            self.fl,
+            self.ie,
             self.ram_read(self.pc),
             self.ram_read(self.pc + 1),
             self.ram_read(self.pc + 2)
         ), end='')
 
         for i in range(8):
-            print(" %02X" % self.registers[i], end='')
+            print(" %02X" % self.reg[i], end='')
 
         print()
 
     def run(self):
         """Run the CPU."""
-        running = True
-        while running:
-            #self.trace()
-            self.ir = self.ram[self.pc]
-            try:
-                op = self.OPCODES[self.ir]
-                # do LDI
-                if op == 'LDI':
-                    reg = self.ram[self.pc+1]
-                    val = self.ram[self.pc+2]
-                    self.registers[reg] = val
-                    self.pc += 3
+        while not self.halted:
+            # Interrupt code
 
-                # do Print
-                elif op == 'PRN':
-                    reg = self.ram[self.pc+1]
-                    val = self.registers[reg]
-                    print(f"hex val: {val:x}\tdec val: {val}")
-                    self.pc += 2
+            self.check_for_timer_int()     # timer interrupt check
+            # self.check_for_keyboard_int()  # keyboard interrupt check
+            self.handle_ints()             # see if any interrupts occurred
 
-                # pass to alu
-                elif op == 'ADD' or op == 'MUL':
-                    reg_a = self.ram[self.pc+1]
-                    reg_b = self.ram[self.pc+2]
-                    self.alu(op, reg_a, reg_b)
-                    self.pc += 3
+            # Normal instruction processing
 
-                # push
-                elif op == 'PUSH':
+            # self.trace()
 
-                    reg = self.ram[self.pc + 1]
-                    val = self.registers[reg]
-                    #if val in self.OPCODES.keys():
-                    #    print("hi")
-                    #Decrement the SP.
-                    self.registers[self.spl] -= 1
-                    # Copy the value in the given register to the address pointed to by SP.
-                    self.ram[self.registers[self.spl]] = val
-                    self.pc += 2
+            ir = self.ram[self.pc]
+            operand_a = self.ram_read(self.pc + 1)
+            operand_b = self.ram_read(self.pc + 2)
 
-                # pop
-                elif op == 'POP':
-                    reg = self.ram[self.pc + 1]
-                    val = self.ram[self.registers[self.spl]]
-                    # Copy the value from the address pointed to by SP to the given register.
-                    self.registers[reg] = val
-                    # Increment SP.
-                    self.registers[self.spl] += 1
-                    self.pc += 2
+            inst_size = ((ir >> 6) & 0b11) + 1
+            self.inst_set_pc = ((ir >> 4) & 0b1) == 1
 
-                # ST
-                elif op == 'ST':
-                    # Store value in registerB in the address stored in registerA.
-                    # This opcode writes to memory.
-                    reg_a = self.ram[self.pc + 1]
-                    reg_b = self.ram[self.pc + 2]
-                    address_a = self.registers[reg_a]
-                    val_b = self.registers[reg_b]
-                    self.ram[addres_a] = val_b
-                    self.pc += 2
+            if ir in self.bt:
+                self.bt[ir](operand_a, operand_b)
+            else:
+                raise Exception(
+                    f"Invalid instruction {hex(ir)} at address {hex(self.pc)}")
 
-                # exit
-                elif op == 'HLT':
-                    running = False
-                    # self.pc += 1 # i don't know if it makes sense to do this.
+            # If the instruction didn't set the PC, just move to the next instruction
+            if not self.inst_set_pc:
+                self.pc += inst_size
+
+    def op_ldi(self, operand_a, operand_b):
+        self.reg[operand_a] = operand_b
+
+    def op_prn(self, operand_a, operand_b):
+        print(self.reg[operand_a])
+
+    def op_pra(self, operand_a, operand_b):
+        print(chr(self.reg[operand_a]), end='')
+        sys.stdout.flush()
+
+    def op_add(self, operand_a, operand_b):
+        self.alu("ADD", operand_a, operand_b)
+
+    def op_sub(self, operand_a, operand_b):
+        self.alu("SUB", operand_a, operand_b)
+
+    def op_mul(self, operand_a, operand_b):
+        self.alu("MUL", operand_a, operand_b)
+
+    def op_div(self, operand_a, operand_b):
+        self.alu("DIV", operand_a, operand_b)
+
+    def op_dec(self, operand_a, operand_b):
+        self.alu("DEC", operand_a, None)
+
+    def op_inc(self, operand_a, operand_b):
+        self.alu("INC", operand_a, None)
+
+    def op_or(self, operand_a, operand_b):
+        self.alu("OR", operand_a, operand_b)
+
+    def op_pop(self, operand_a, operand_b):
+        self.reg[operand_a] = self.pop_val()
+
+    def op_push(self, operand_a, operand_b):
+        self.push_val(self.reg[operand_a])
+
+    def op_call(self, operand_a, operand_b):
+        self.push_val(self.pc + 2)
+        self.pc = self.reg[operand_a]
+
+    def op_ret(self, operand_a, operand_b):
+        self.pc = self.pop_val()
+
+    def op_ld(self, operand_a, operand_b):
+        self.reg[operand_a] = self.ram_read(self.reg[operand_b])
+
+    def op_st(self, operand_a, operand_b):
+        self.ram_write(self.reg[operand_b], self.reg[operand_a])
+
+    def op_jmp(self, operand_a, operand_b):
+        self.pc = self.reg[operand_a]
+
+    def op_jeq(self, operand_a, operand_b):
+        if self.fl & FL_EQ:
+            self.pc = self.reg[operand_a]
+        else:
+            self.inst_set_pc = False
+
+    def op_jne(self, operand_a, operand_b):
+        if not self.fl & FL_EQ:
+            self.pc = self.reg[operand_a]
+        else:
+            self.inst_set_pc = False
+
+    def op_cmp(self, operand_a, operand_b):
+        self.alu("CMP", operand_a, operand_b)
+
+    def op_iret(self, operand_a, operand_b):
+        # restore work from stack
+        for i in range(6, -1, -1):
+            self.reg[i] = self.pop_val()
+        self.fl = self.pop_val()
+        self.pc = self.pop_val()
+
+        # enable interrupts
+        self.ie = 1
+
+    def op_hlt(self, operand_a, operand_b):
+        self.halted = True
 
 
-            except KeyError as e:
-                print(f"unknown command {self.ir}")
-                self.pc += 1
-        pass
-
-    def ram_read(self, location):
-        """ read from ram
-            accept the address to read and return the value stored there
-        """
-        return self.ram[location]
-
-    def ram_write(self, location, value):
-        """ write to ram
-        accept a value to write, and the address to write it to.
-        """
-        self.ram[location] = value
+# python ls8.py examples/print8.ls8 => 8
+# python3 ls8.py examples/mult.ls8 => 72
